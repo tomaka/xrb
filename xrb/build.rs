@@ -25,6 +25,10 @@ fn main() {
 
     let mut file = File::create(&dest.join("output.rs")).unwrap();
     writeln!(&mut file, r#"
+use std::net::{{ToSocketAddrs, TcpStream}};
+use std::sync::Mutex;
+use std::io::Result as IoResult;
+
 /// Represents a connection to an X server.
 pub struct XConnection {{
     socket: Mutex<TcpStream>,
@@ -45,6 +49,10 @@ pub struct XConnection {{
 /// Iterator for the events received by the server.
 pub struct Events<'a> {{
     connection: &'a mut XConnection,
+}}
+
+trait SocketSend {{
+    fn send(&self) -> IoResult<()>;
 }}
 
 enum Reply {{
@@ -281,7 +289,7 @@ fn parse_request<R>(parse: &mut ParseResult, events: &mut EventReader<R>,
                 if name.local_name == "field" =>
             {
                 let ty = get_attribute(attributes, "type").unwrap();
-                let name = get_attribute(attributes, "name").unwrap();
+                let name = rustyfi_name(get_attribute(attributes, "name").unwrap());
                 write!(definition, ", {}: {}", name, ty);
                 writeln!(instructions, "\ttry!(self.socket.write({}));", name).unwrap();
             },
@@ -346,5 +354,13 @@ fn parse_event<R>(output: &mut ParseResult, events: &mut EventReader<R>, name: &
 
             msg => ()       // FIXME: err
         }
+    }
+}
+
+fn rustyfi_name(name: String) -> String {
+    if name == "type" {
+        "ty".to_string()
+    } else {
+        name
     }
 }
