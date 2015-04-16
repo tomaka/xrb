@@ -13,7 +13,7 @@ fn main() {
     let dest = env::var("OUT_DIR").unwrap();
     let dest = Path::new(&dest);
 
-    let mut parse = ParseResult {
+    let mut parse_result = ParseResult {
         replies_list: Vec::new(),
         replies_types: Vec::new(),
         events_list: Vec::new(),
@@ -21,44 +21,55 @@ fn main() {
         requests_list: Vec::new(),
     };
 
-    parse(&mut parse, Cursor::new(xmlxcb::XPROTO));
+    parse(&mut parse_result, Cursor::new(xmlxcb::XPROTO));
 
-    writeln!(&mut File::create(&dest.join("definitions.rs")).unwrap(), r#"
+    let mut file = File::create(&dest.join("definitions.rs")).unwrap();
+    writeln!(&mut file, r#"
+/// Represents a connection to an X server.
 pub struct XConnection {{
-    socket: TcpStream,
+    socket: Mutex<TcpStream>,
     
     // sequence number attributed to the next request
-    sequence: u32,
+    sequence: Mutex<u32>,
 
     // list of received events that have to be retreived by the user
-    pending_events: Vec<Event>,
+    pending_events: Mutex<Vec<Event>>,
 
     // list of answers that have to be retreived by the user
-    pending_answers: Lock<Vec<(u16, Reply)>>,
+    pending_answers: Mutex<Vec<(u16, Reply)>>,
 
     // sequence numbers of requests waiting for an answer
-    waiting_for_answer: Lock<Vec<(u16, ReplyType)>>,
+    waiting_for_answer: Mutex<Vec<(u16, ReplyType)>>,
 }}
 
+/// Iterator for the events received by the server.
 pub struct Events<'a> {{
     connection: &'a mut XConnection,
 }}
 
 enum Reply {{
-    // replies list here
+        "#).unwrap();
+    file.write_all(&parse_result.replies_list).unwrap();
+    writeln!(&mut file, r#"
     Error(XError),
 }}
 
 enum ReplyType {{
-    // replies list
+        "#).unwrap();
+    file.write_all(&parse_result.replies_types).unwrap();
+    writeln!(&mut file, r#"
 }}
 
 pub enum Event {{
-    // events list here
+        "#).unwrap();
+    file.write_all(&parse_result.events_list).unwrap();
+    writeln!(&mut file, r#"
 }}
 
 pub enum XError {{
-    // errors list here
+        "#).unwrap();
+    file.write_all(&parse_result.errors_list).unwrap();
+    writeln!(&mut file, r#"
 }}
 
 pub struct ReplyHandle<'a, T> {{
@@ -82,8 +93,13 @@ impl XConnection {{
         }}
     }}
 
+    // REMOVE ME
     pub fn something_request(&self, param1: u32) -> ReplyHandle<SomethingReply> {{
     }}
+
+        "#).unwrap();
+    file.write_all(&parse_result.requests_list).unwrap();
+    writeln!(&mut file, r#"
 }}
 
 impl<'a, T> ReplyHandle<'a, T> {{
@@ -158,7 +174,7 @@ fn parse<R>(parse: &mut ParseResult, input: R) where R: Read {
             {
                 let name = get_attribute(attributes, "name").unwrap();
                 let number = get_attribute(attributes, "number").unwrap().parse().unwrap();
-                parse_request(parse, &mut events, &name, number);
+                parse_event(parse, &mut events, &name, number);
             },
 
             // we ignore `<import />` as it's C-specific
@@ -198,15 +214,15 @@ fn get_attribute(a: &[xml::attribute::OwnedAttribute], name: &str) -> Option<Str
 fn parse_struct<R>(parse: &mut ParseResult, events: &mut EventReader<R>, struct_name: &str)
                    where R: Read
 {
-    let mut pad_num = 0;
+    //let mut pad_num = 0;
 
-    writeln!(definitions, "pub struct {} {{", struct_name).unwrap();
+    //writeln!(definitions, "pub struct {} {{", struct_name).unwrap();
 
     loop {
         match recv(events) {
             XmlEvent::EndElement{ref name} if name.local_name == "struct" => break,
 
-            XmlEvent::StartElement{ref name, ref attributes, ..}
+            /*XmlEvent::StartElement{ref name, ref attributes, ..}
                 if name.local_name == "field" =>
             {
                 let ty = get_attribute(attributes, "type").unwrap();
@@ -224,13 +240,13 @@ fn parse_struct<R>(parse: &mut ParseResult, events: &mut EventReader<R>, struct_
                 pad_num += 1;
             },
 
-            XmlEvent::EndElement{ref name} if name.local_name == "pad" => (),
+            XmlEvent::EndElement{ref name} if name.local_name == "pad" => (),*/
 
-            msg => panic!("Unexpected {:?}", msg),
+            msg => ()//panic!("Unexpected {:?}", msg),
         }
     }
 
-    writeln!(definitions, "}}").unwrap();
+    //writeln!(definitions, "}}").unwrap();
 }
 
 fn parse_request<R>(parse: &mut ParseResult, events: &mut EventReader<R>,
@@ -281,13 +297,13 @@ fn parse_request<R>(parse: &mut ParseResult, events: &mut EventReader<R>,
         }
     }
 
-    output.write_all(&docs).unwrap();
-    writeln!(output, "").unwrap();
-    output.write_all(&definition).unwrap();
-    writeln!(output, ") {{").unwrap();
-    output.write_all(&instructions).unwrap();
-    writeln!(output, "}}").unwrap();
-    writeln!(output, "").unwrap();
+    parse.requests_list.write_all(&docs).unwrap();
+    writeln!(parse.requests_list, "").unwrap();
+    parse.requests_list.write_all(&definition).unwrap();
+    writeln!(parse.requests_list, ") {{").unwrap();
+    parse.requests_list.write_all(&instructions).unwrap();
+    writeln!(parse.requests_list, "}}").unwrap();
+    writeln!(parse.requests_list, "").unwrap();
 }
 
 fn parse_doc<R, W>(output: &mut W, events: &mut EventReader<R>)
@@ -312,12 +328,21 @@ fn parse_doc<R, W>(output: &mut W, events: &mut EventReader<R>)
     }
 }
 
-fn parse_event<R, W>(output: &mut W, events: &mut EventReader<R>, name: &str, number: u8)
-                     where W: Write, R: Read
+fn parse_event<R>(output: &mut ParseResult, events: &mut EventReader<R>, name: &str, number: u8)
+                  where R: Read
 {
+    let mut docs = Vec::new();
+
     loop {
         match recv(events) {
             XmlEvent::EndElement{ref name} if name.local_name == "event" => break,
+
+            // `<doc>`
+            XmlEvent::StartElement{ref name, ref attributes, ..}
+                if name.local_name == "doc" =>
+            {
+                parse_doc(&mut docs, events);
+            },
 
             msg => ()       // FIXME: err
         }
