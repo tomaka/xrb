@@ -13,12 +13,18 @@ fn main() {
     let dest = env::var("OUT_DIR").unwrap();
     let dest = Path::new(&dest);
 
-    parse(&mut File::create(&dest.join("definitions.rs")).unwrap(), Cursor::new(xmlxcb::XPROTO));
-}
+    let mut parse = ParseResult {
+        replies_list: Vec::new(),
+        replies_types: Vec::new(),
+        events_list: Vec::new(),
+        errors_list: Vec::new(),
+        requests_list: Vec::new(),
+    };
 
-/*
+    parse(&mut parse, Cursor::new(xmlxcb::XPROTO));
 
-pub struct XConnection {
+    writeln!(&mut File::create(&dest.join("definitions.rs")).unwrap(), r#"
+pub struct XConnection {{
     socket: TcpStream,
     
     // sequence number attributed to the next request
@@ -28,34 +34,99 @@ pub struct XConnection {
     pending_events: Vec<Event>,
 
     // list of answers that have to be retreived by the user
-    pending_answers: Vec<(u16, Reply)>,
+    pending_answers: Lock<Vec<(u16, Reply)>>,
 
     // sequence numbers of requests waiting for an answer
-    waiting_for_answer: Vec<u16>,
-}
+    waiting_for_answer: Lock<Vec<(u16, ReplyType)>>,
+}}
 
-pub struct Events<'a> {
+pub struct Events<'a> {{
     connection: &'a mut XConnection,
-}
+}}
 
-impl XConnection {
+enum Reply {{
+    // replies list here
+    Error(XError),
+}}
+
+enum ReplyType {{
+    // replies list
+}}
+
+pub enum Event {{
+    // events list here
+}}
+
+pub enum XError {{
+    // errors list here
+}}
+
+pub struct ReplyHandle<'a, T> {{
+    connection: &'a XConnection,
+    sequence: u16,
+    get_reply: fn(Reply) -> Result<T, XError>;
+}}
+
+impl XConnection {{
     /// Connects to an X server.
     ///
     /// Blocks until the server returns a success or an error.
-    pub fn connect<A>(address: A) -> XConnection where A: ToSocketAddrs {
+    pub fn connect<A>(address: A) -> XConnection where A: ToSocketAddrs {{
         let connection = TcpStream::connect(address);
-    }
+    }}
 
-    pub fn events(&mut self) -> Events {
-        Events {
+    /// Obtain an iterator for the events is the connection's queue.
+    pub fn events(&mut self) -> Events {{
+        Events {{
             connection: self,
-        }
-    }
+        }}
+    }}
+
+    pub fn something_request(&self, param1: u32) -> ReplyHandle<SomethingReply> {{
+    }}
+}}
+
+impl<'a, T> ReplyHandle<'a, T> {{
+    /// Obtain the reply.
+    pub fn get(self) -> Result<T, XError> {{
+        while !self.is_ready() {{
+            self.connection.process_next();
+        }}
+
+        let mut pending = self.connection.pending_answers.lock();
+        let reply = pending.position(|&(seq, _)| seq == self.sequence).unwrap();
+        let reply = pending.remove(reply);
+        self.get_reply(reply)
+    }}
+
+    /// Returns true if the reply has been received.
+    pub fn is_ready(&self) -> bool {{
+        let mut pending = self.connection.pending_answers.lock();
+        pending.find(|&(seq, _)| seq == self.sequence).is_some()
+    }}
+}}
+
+impl<'a, T> Drop for ReplyHandle<'a, T> {{
+    fn drop(&mut self) {{
+        let mut pending = self.connection.pending_answers.lock();
+        let mut waiting = self.connection.waiting_for_answer.lock();
+
+        pending.retain(|&(seq, _)| seq != self.sequence);
+        waiting.retain(|&(seq, _)| seq != self.sequence);
+    }}
+}}
+        "#).unwrap();
 }
 
-*/
+struct ParseResult {
+    replies_list: Vec<u8>,
+    replies_types: Vec<u8>,
+    events_list: Vec<u8>,
+    errors_list: Vec<u8>,
+    requests_list: Vec<u8>,
+}
 
-fn parse<R, W>(definitions: &mut W, input: R) where W: Write, R: Read {
+fn parse<R>(parse: &mut ParseResult, input: R) where R: Read {
     let mut events = EventReader::new(input);
 
     match recv(&mut events) {
@@ -69,7 +140,7 @@ fn parse<R, W>(definitions: &mut W, input: R) where W: Write, R: Read {
                 if name.local_name == "struct" =>
             {
                 let struct_name = get_attribute(attributes, "name").unwrap();
-                parse_struct(definitions, &mut events, &struct_name);
+                parse_struct(parse, &mut events, &struct_name);
             },*/
 
             // `<request>`
@@ -78,7 +149,7 @@ fn parse<R, W>(definitions: &mut W, input: R) where W: Write, R: Read {
             {
                 let name = get_attribute(attributes, "name").unwrap();
                 let opcode = get_attribute(attributes, "opcode").unwrap().parse().unwrap();
-                parse_request(definitions, &mut events, &name, opcode);
+                parse_request(parse, &mut events, &name, opcode);
             },
 
             // `<event>`
@@ -87,7 +158,7 @@ fn parse<R, W>(definitions: &mut W, input: R) where W: Write, R: Read {
             {
                 let name = get_attribute(attributes, "name").unwrap();
                 let number = get_attribute(attributes, "number").unwrap().parse().unwrap();
-                parse_request(definitions, &mut events, &name, number);
+                parse_request(parse, &mut events, &name, number);
             },
 
             // we ignore `<import />` as it's C-specific
@@ -124,8 +195,8 @@ fn get_attribute(a: &[xml::attribute::OwnedAttribute], name: &str) -> Option<Str
     a.iter().find(|a| a.name.local_name == name).map(|e| e.value.clone())
 }
 
-fn parse_struct<R, W>(definitions: &mut W, events: &mut EventReader<R>, struct_name: &str)
-                      where W: Write, R: Read
+fn parse_struct<R>(parse: &mut ParseResult, events: &mut EventReader<R>, struct_name: &str)
+                   where R: Read
 {
     let mut pad_num = 0;
 
@@ -162,8 +233,8 @@ fn parse_struct<R, W>(definitions: &mut W, events: &mut EventReader<R>, struct_n
     writeln!(definitions, "}}").unwrap();
 }
 
-fn parse_request<R, W>(output: &mut W, events: &mut EventReader<R>, name: &str, opcode: u8)
-                       where W: Write, R: Read
+fn parse_request<R>(parse: &mut ParseResult, events: &mut EventReader<R>,
+                    name: &str, opcode: u8) where R: Read
 {
     let mut instructions = Vec::new();
     writeln!(instructions, "\ttry!(self.socket.write_u8({}));", opcode).unwrap();
