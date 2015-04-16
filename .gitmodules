@@ -1,0 +1,3 @@
+[submodule "xmlxcb/xmlxcb"]
+	path = xmlxcb/xmlxcb
+	url = git://cgit.freedesktop.org/xcb/proto/
