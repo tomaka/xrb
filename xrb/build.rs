@@ -23,7 +23,7 @@ fn main() {
 
     parse(&mut parse_result, Cursor::new(xmlxcb::XPROTO));
 
-    let mut file = File::create(&dest.join("definitions.rs")).unwrap();
+    let mut file = File::create(&dest.join("output.rs")).unwrap();
     writeln!(&mut file, r#"
 /// Represents a connection to an X server.
 pub struct XConnection {{
@@ -75,7 +75,7 @@ pub enum XError {{
 pub struct ReplyHandle<'a, T> {{
     connection: &'a XConnection,
     sequence: u16,
-    get_reply: fn(Reply) -> Result<T, XError>;
+    get_reply: fn(Reply) -> Result<T, XError>,
 }}
 
 impl XConnection {{

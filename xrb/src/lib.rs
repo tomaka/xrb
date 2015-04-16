@@ -1,3 +1,1 @@
-#[test]
-fn it_works() {
-}
+include!(concat!(env!("OUT_DIR"), "/output.rs"));
