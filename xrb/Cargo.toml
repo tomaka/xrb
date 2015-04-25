@@ -4,6 +4,9 @@ version = "0.0.1"
 authors = ["Pierre Krieger <pierre.krieger1708@gmail.com>"]
 build = "build.rs"
 
+[dependencies]
+byteorder = "0.3"
+
 [build-dependencies]
 xml-rs = "0.1"
 

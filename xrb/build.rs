@@ -14,6 +14,7 @@ fn main() {
     let dest = Path::new(&dest);
 
     let mut parse_result = ParseResult {
+        typedefs: Vec::new(),
         replies_list: Vec::new(),
         replies_types: Vec::new(),
         events_list: Vec::new(),
@@ -25,9 +26,21 @@ fn main() {
 
     let mut file = File::create(&dest.join("output.rs")).unwrap();
     writeln!(&mut file, r#"
+extern crate byteorder;
+
+use byteorder::{{ReadBytesExt, WriteBytesExt, BigEndian, LittleEndian}};
 use std::net::{{ToSocketAddrs, TcpStream}};
 use std::sync::Mutex;
 use std::io::Result as IoResult;
+
+pub type BYTE = u8;
+pub type INT8 = i8;
+pub type INT16 = i16;
+pub type INT32 = i32;
+pub type CARD8 = u8;
+pub type CARD16 = u16;
+pub type CARD32 = u32;
+pub type BOOL = bool;
 
 /// Represents a connection to an X server.
 pub struct XConnection {{
@@ -46,13 +59,29 @@ pub struct XConnection {{
     waiting_for_answer: Mutex<Vec<(u16, ReplyType)>>,
 }}
 
+        "#).unwrap();
+    file.write_all(&parse_result.typedefs).unwrap();
+    writeln!(&mut file, r#"
+
 /// Iterator for the events received by the server.
 pub struct Events<'a> {{
     connection: &'a mut XConnection,
 }}
 
 trait SocketSend {{
-    fn send(&self) -> IoResult<()>;
+    fn socket_send(&self, socket: &mut TcpStream) -> IoResult<()>;
+}}
+
+impl SocketSend for i8 {{
+    fn socket_send(&self, socket: &mut TcpStream) -> IoResult<()> {{
+        socket.write_i8(*self)
+    }}
+}}
+
+impl SocketSend for u8 {{
+    fn socket_send(&self, socket: &mut TcpStream) -> IoResult<()> {{
+        socket.write_u8(*self)
+    }}
 }}
 
 enum Reply {{
@@ -143,6 +172,7 @@ impl<'a, T> Drop for ReplyHandle<'a, T> {{
 }
 
 struct ParseResult {
+    typedefs: Vec<u8>,
     replies_list: Vec<u8>,
     replies_types: Vec<u8>,
     events_list: Vec<u8>,
@@ -174,6 +204,33 @@ fn parse<R>(parse: &mut ParseResult, input: R) where R: Read {
                 let name = get_attribute(attributes, "name").unwrap();
                 let opcode = get_attribute(attributes, "opcode").unwrap().parse().unwrap();
                 parse_request(parse, &mut events, &name, opcode);
+            },
+
+            // `<typedef>`
+            XmlEvent::StartElement{ref name, ref attributes, ..}
+                if name.local_name == "typedef" =>
+            {
+                let oldname = get_attribute(attributes, "oldname").unwrap();
+                let newname = get_attribute(attributes, "newname").unwrap();
+                writeln!(parse.typedefs, "pub type {} = {};", newname, oldname).unwrap();
+            },
+            XmlEvent::EndElement{ref name, ..} if name.local_name == "typedef" => {
+            },
+
+            // `<xidtype>`
+            XmlEvent::StartElement{ref name, ref attributes, ..}
+                if name.local_name == "xidtype" =>
+            {
+                let name = get_attribute(attributes, "name").unwrap();
+                writeln!(parse.typedefs, "pub struct {}(pub u32);", name).unwrap();
+                writeln!(parse.typedefs, r#"
+                    impl SocketSend for {} {{
+                        fn socket_send(&self, socket: &mut TcpStream) -> IoResult<()> {{
+                            socket.write_u32::<BigEndian>(self.0)
+                        }}
+                    }}"#, name).unwrap();
+            },
+            XmlEvent::EndElement{ref name, ..} if name.local_name == "xidtype" => {
             },
 
             // `<event>`
@@ -260,11 +317,14 @@ fn parse_struct<R>(parse: &mut ParseResult, events: &mut EventReader<R>, struct_
 fn parse_request<R>(parse: &mut ParseResult, events: &mut EventReader<R>,
                     name: &str, opcode: u8) where R: Read
 {
-    let mut instructions = Vec::new();
-    writeln!(instructions, "\ttry!(self.socket.write_u8({}));", opcode).unwrap();
+    let mut function_body = Vec::new();
+    writeln!(function_body, r#"
+        let mut socket = self.socket.lock().unwrap();
+        try!(socket.write_u8({}));"#, opcode).unwrap();
+    let mut offset = 1;
 
-    let mut definition = Vec::new();
-    write!(definition, "pub fn {}_request(&mut self", name).unwrap();
+    let mut request_function = Vec::new();
+    write!(request_function, "pub fn {}_request(&mut self", name).unwrap();
 
     let mut docs = Vec::new();
 
@@ -278,9 +338,11 @@ fn parse_request<R>(parse: &mut ParseResult, events: &mut EventReader<R>,
                 if name.local_name == "pad" =>
             {
                 let bytes = get_attribute(attributes, "bytes").unwrap();
-                writeln!(instructions, "\tfor _ in 0 .. {} {{ \
-                                            try!(self.socket.write_u8(0)); \
-                                        }}", bytes).unwrap();
+                let bytes: usize = bytes.parse().unwrap();
+                writeln!(function_body, "\tfor _ in 0 .. {} {{ \
+                                             try!(socket.write_u8(0)); \
+                                         }}", bytes).unwrap();
+                offset += bytes;
             },
 
             // `<field type="..." name="..." />`
@@ -290,8 +352,9 @@ fn parse_request<R>(parse: &mut ParseResult, events: &mut EventReader<R>,
             {
                 let ty = get_attribute(attributes, "type").unwrap();
                 let name = rustyfi_name(get_attribute(attributes, "name").unwrap());
-                write!(definition, ", {}: {}", name, ty);
-                writeln!(instructions, "\ttry!(self.socket.write({}));", name).unwrap();
+                write!(request_function, ", {}: {}", name, ty);
+                writeln!(function_body, "\ttry!({}.socket_send(&mut socket));", name).unwrap();
+                offset += 1;        // FIXME: real number
             },
 
             // `<doc>`
@@ -303,13 +366,42 @@ fn parse_request<R>(parse: &mut ParseResult, events: &mut EventReader<R>,
 
             msg => ()// FIXME: panic!("Unexpected {:?}", msg),
         }
+
+        if offset == 2 {
+            writeln!(function_body, "\tlet seq = self.sequence.lock().unwrap();").unwrap();
+            writeln!(function_body, "\t*seq += 1;").unwrap();
+            writeln!(function_body, "\tlet seq = *seq;").unwrap();
+            writeln!(function_body, "\ttry!(seq.socket_send(&mut socket));").unwrap();
+            offset += 2;
+        }
     }
+
+    if offset == 1 {
+        writeln!(function_body, "\ttry!(self.socket.write_u8(0));").unwrap();
+        offset += 1;
+    }
+
+    if offset == 2 {
+        writeln!(function_body, "\tlet seq = self.sequence.lock().unwrap();").unwrap();
+        writeln!(function_body, "\t*seq += 1;").unwrap();
+        writeln!(function_body, "\tlet seq = *seq;").unwrap();
+        writeln!(function_body, "\ttry!(seq.socket_send(&mut socket));").unwrap();
+        offset += 2;
+    }
+
+    writeln!(function_body, r#"
+        ReplyHandle {{
+            connection: self,
+            sequence: seq,
+            get_reply: unimplemented!()
+        }}"#).unwrap();
 
     parse.requests_list.write_all(&docs).unwrap();
     writeln!(parse.requests_list, "").unwrap();
-    parse.requests_list.write_all(&definition).unwrap();
-    writeln!(parse.requests_list, ") {{").unwrap();
-    parse.requests_list.write_all(&instructions).unwrap();
+    parse.requests_list.write_all(&request_function).unwrap();
+    write!(parse.requests_list, ") -> ReplyHandle<").unwrap();
+    writeln!(parse.requests_list, "> {{").unwrap();
+    parse.requests_list.write_all(&function_body).unwrap();
     writeln!(parse.requests_list, "}}").unwrap();
     writeln!(parse.requests_list, "").unwrap();
 }
