@@ -9,6 +9,10 @@ use std::path::Path;
 use xml::reader::EventReader;
 use xml::reader::events::XmlEvent;
 
+use struct_parser::{StructContentParser, StructType};
+
+mod struct_parser;
+
 fn main() {
     let dest = env::var("OUT_DIR").unwrap();
     let dest = Path::new(&dest);
@@ -31,6 +35,7 @@ extern crate byteorder;
 use byteorder::{{ReadBytesExt, WriteBytesExt, BigEndian, LittleEndian}};
 use std::net::{{ToSocketAddrs, TcpStream}};
 use std::sync::Mutex;
+use std::sync::atomic::{{AtomicUsize, Ordering}};
 use std::io::Result as IoResult;
 
 pub type BYTE = u8;
@@ -47,7 +52,7 @@ pub struct XConnection {{
     socket: Mutex<TcpStream>,
     
     // sequence number attributed to the next request
-    sequence: Mutex<u32>,
+    sequence: AtomicUsize,
 
     // list of received events that have to be retreived by the user
     pending_events: Mutex<Vec<Event>>,
@@ -81,6 +86,30 @@ impl SocketSend for i8 {{
 impl SocketSend for u8 {{
     fn socket_send(&self, socket: &mut TcpStream) -> IoResult<()> {{
         socket.write_u8(*self)
+    }}
+}}
+
+impl SocketSend for i16 {{
+    fn socket_send(&self, socket: &mut TcpStream) -> IoResult<()> {{
+        socket.write_i16::<BigEndian>(*self)
+    }}
+}}
+
+impl SocketSend for u16 {{
+    fn socket_send(&self, socket: &mut TcpStream) -> IoResult<()> {{
+        socket.write_u16::<BigEndian>(*self)
+    }}
+}}
+
+impl SocketSend for i32 {{
+    fn socket_send(&self, socket: &mut TcpStream) -> IoResult<()> {{
+        socket.write_i32::<BigEndian>(*self)
+    }}
+}}
+
+impl SocketSend for u32 {{
+    fn socket_send(&self, socket: &mut TcpStream) -> IoResult<()> {{
+        socket.write_u32::<BigEndian>(*self)
     }}
 }}
 
@@ -128,10 +157,6 @@ impl XConnection {{
         Events {{
             connection: self,
         }}
-    }}
-
-    // REMOVE ME
-    pub fn something_request(&self, param1: u32) -> ReplyHandle<SomethingReply> {{
     }}
 
         "#).unwrap();
@@ -190,12 +215,13 @@ fn parse<R>(parse: &mut ParseResult, input: R) where R: Read {
 
     loop {
         match recv(&mut events) {
-            /*XmlEvent::StartElement{ref name, ref attributes, ..}
+            // `<struct>`
+            XmlEvent::StartElement{ref name, ref attributes, ..}
                 if name.local_name == "struct" =>
             {
                 let struct_name = get_attribute(attributes, "name").unwrap();
                 parse_struct(parse, &mut events, &struct_name);
-            },*/
+            },
 
             // `<request>`
             XmlEvent::StartElement{ref name, ref attributes, ..}
@@ -279,39 +305,16 @@ fn get_attribute(a: &[xml::attribute::OwnedAttribute], name: &str) -> Option<Str
 fn parse_struct<R>(parse: &mut ParseResult, events: &mut EventReader<R>, struct_name: &str)
                    where R: Read
 {
-    //let mut pad_num = 0;
-
-    //writeln!(definitions, "pub struct {} {{", struct_name).unwrap();
+    let mut request_struct_parser = StructContentParser::new(struct_name, StructType::Struct);
 
     loop {
         match recv(events) {
             XmlEvent::EndElement{ref name} if name.local_name == "struct" => break,
-
-            /*XmlEvent::StartElement{ref name, ref attributes, ..}
-                if name.local_name == "field" =>
-            {
-                let ty = get_attribute(attributes, "type").unwrap();
-                let name = get_attribute(attributes, "name").unwrap();
-                writeln!(definitions, "\t{}: {},", name, ty).unwrap();
-            },
-
-            XmlEvent::EndElement{ref name} if name.local_name == "field" => (),
-
-            XmlEvent::StartElement{ref name, ref attributes, ..}
-                if name.local_name == "pad" =>
-            {
-                let bytes = get_attribute(attributes, "bytes").unwrap();
-                writeln!(definitions, "\tpad{}: [u8; {}],", pad_num, bytes).unwrap();
-                pad_num += 1;
-            },
-
-            XmlEvent::EndElement{ref name} if name.local_name == "pad" => (),*/
-
-            msg => ()//panic!("Unexpected {:?}", msg),
+            ev => request_struct_parser.feed(ev, events),
         }
     }
 
-    //writeln!(definitions, "}}").unwrap();
+    request_struct_parser.finish(&mut parse.typedefs);
 }
 
 fn parse_request<R>(parse: &mut ParseResult, events: &mut EventReader<R>,
@@ -320,42 +323,15 @@ fn parse_request<R>(parse: &mut ParseResult, events: &mut EventReader<R>,
     let mut function_body = Vec::new();
     writeln!(function_body, r#"
         let mut socket = self.socket.lock().unwrap();
-        try!(socket.write_u8({}));"#, opcode).unwrap();
-    let mut offset = 1;
-
-    let mut request_function = Vec::new();
-    write!(request_function, "pub fn {}_request(&mut self", name).unwrap();
+        let seq = self.sequence.fetch_add(1, Ordering::Relaxed) as u32;"#).unwrap();
 
     let mut docs = Vec::new();
+
+    let mut request_struct_parser = StructContentParser::new("Request", StructType::Request { opcode: opcode });
 
     loop {
         match recv(events) {
             XmlEvent::EndElement{ref name} if name.local_name == "request" => break,
-
-            // `<pad bytes="N" />`
-            XmlEvent::EndElement{ref name} if name.local_name == "pad" => (),
-            XmlEvent::StartElement{ref name, ref attributes, ..}
-                if name.local_name == "pad" =>
-            {
-                let bytes = get_attribute(attributes, "bytes").unwrap();
-                let bytes: usize = bytes.parse().unwrap();
-                writeln!(function_body, "\tfor _ in 0 .. {} {{ \
-                                             try!(socket.write_u8(0)); \
-                                         }}", bytes).unwrap();
-                offset += bytes;
-            },
-
-            // `<field type="..." name="..." />`
-            XmlEvent::EndElement{ref name} if name.local_name == "field" => (),
-            XmlEvent::StartElement{ref name, ref attributes, ..}
-                if name.local_name == "field" =>
-            {
-                let ty = get_attribute(attributes, "type").unwrap();
-                let name = rustyfi_name(get_attribute(attributes, "name").unwrap());
-                write!(request_function, ", {}: {}", name, ty);
-                writeln!(function_body, "\ttry!({}.socket_send(&mut socket));", name).unwrap();
-                offset += 1;        // FIXME: real number
-            },
 
             // `<doc>`
             XmlEvent::StartElement{ref name, ref attributes, ..}
@@ -364,42 +340,45 @@ fn parse_request<R>(parse: &mut ParseResult, events: &mut EventReader<R>,
                 parse_doc(&mut docs, events);
             },
 
-            msg => ()// FIXME: panic!("Unexpected {:?}", msg),
-        }
-
-        if offset == 2 {
-            writeln!(function_body, "\tlet seq = self.sequence.lock().unwrap();").unwrap();
-            writeln!(function_body, "\t*seq += 1;").unwrap();
-            writeln!(function_body, "\tlet seq = *seq;").unwrap();
-            writeln!(function_body, "\ttry!(seq.socket_send(&mut socket));").unwrap();
-            offset += 2;
+            ev => request_struct_parser.feed(ev, events),
         }
     }
 
-    if offset == 1 {
-        writeln!(function_body, "\ttry!(self.socket.write_u8(0));").unwrap();
-        offset += 1;
+    let fields = request_struct_parser.finish(&mut function_body);
+
+    let mut request_function = Vec::new();
+    let mut struct_construction = Vec::new();
+    write!(request_function, "pub fn {}_request(&mut self", name).unwrap();
+    for (name, ty) in fields {
+        write!(&mut request_function, ", {}: {}", name, ty).unwrap();
+        write!(&mut struct_construction, "{}: {},", name, name);
     }
 
-    if offset == 2 {
-        writeln!(function_body, "\tlet seq = self.sequence.lock().unwrap();").unwrap();
-        writeln!(function_body, "\t*seq += 1;").unwrap();
-        writeln!(function_body, "\tlet seq = *seq;").unwrap();
-        writeln!(function_body, "\ttry!(seq.socket_send(&mut socket));").unwrap();
-        offset += 2;
+    if struct_construction.is_empty() {
+        write!(function_body, "Request {{ e: () }}").unwrap();
+    } else {
+        write!(function_body, "Request {{").unwrap();
+        function_body.write_all(&struct_construction).unwrap();
+        write!(function_body, "}}").unwrap();
     }
-
     writeln!(function_body, r#"
+        .send(&mut socket, seq);
+
+        fn get_reply(_: Reply) -> Result<(), XError> {{
+            Ok(())
+        }}
+
         ReplyHandle {{
             connection: self,
-            sequence: seq,
-            get_reply: unimplemented!()
+            sequence: seq & 0xffff,
+            get_reply: get_reply,
         }}"#).unwrap();
 
     parse.requests_list.write_all(&docs).unwrap();
     writeln!(parse.requests_list, "").unwrap();
     parse.requests_list.write_all(&request_function).unwrap();
     write!(parse.requests_list, ") -> ReplyHandle<").unwrap();
+    write!(parse.requests_list, "()").unwrap();
     writeln!(parse.requests_list, "> {{").unwrap();
     parse.requests_list.write_all(&function_body).unwrap();
     writeln!(parse.requests_list, "}}").unwrap();
